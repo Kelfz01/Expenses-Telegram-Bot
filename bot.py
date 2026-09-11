@@ -1,8 +1,15 @@
 import os
 import logging
 from io import BytesIO
+from datetime import datetime
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -35,6 +42,15 @@ def is_authorized(user_id: int) -> bool:
         return True
     return user_id in ALLOWED_USER_IDS
 
+# Persistent reply keyboard for one-tap queries
+def get_main_menu_keyboard():
+    keyboard = [
+        [KeyboardButton("💰 Current Balance"), KeyboardButton("📅 Expense Today")],
+        [KeyboardButton("📊 Expense This Week"), KeyboardButton("🗓️ Expense This Month")],
+        [KeyboardButton("🕒 Recent Transactions"), KeyboardButton("❓ Help")],
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
 def get_tx_inline_keyboard(tx_id: int) -> InlineKeyboardMarkup:
     keyboard = [
         [
@@ -43,8 +59,8 @@ def get_tx_inline_keyboard(tx_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("✏️ Shopping", callback_data=f"setcat_{tx_id}_Shopping"),
         ],
         [
-            InlineKeyboardButton("✏️ Bills/Utilities", callback_data=f"setcat_{tx_id}_Bills & Utilities"),
-            InlineKeyboardButton("✏️ General", callback_data=f"setcat_{tx_id}_General"),
+            InlineKeyboardButton("✏️ Bills", callback_data=f"setcat_{tx_id}_Bills & Utilities"),
+            InlineKeyboardButton("💳 Paid via Cash", callback_data=f"setacc_{tx_id}_cash"),
             InlineKeyboardButton("🗑️ Delete", callback_data=f"deltx_{tx_id}"),
         ]
     ]
@@ -57,25 +73,105 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = (
-        "👋 *Hello! I am your Expense & Income Bot.*\n\n"
-        "📸 *How to track:*\n"
-        "• Send or share any bank transfer/payment slip photo.\n"
-        "• I will auto-detect amount, date, receiver, and category.\n"
-        "• Quick category buttons and delete button will appear under each slip!\n\n"
-        "✏️ *How to edit or change details:*\n"
-        "• `/edit <id> category <new category>` (e.g. `/edit 5 category Coffee`)\n"
-        "• `/edit <id> amount <new amount>` (e.g. `/edit 5 amount 120.50`)\n"
-        "• `/edit <id> note <new note>` (e.g. `/edit 5 note Dinner with team`)\n"
-        "• Or just natural language: _'change category of transaction 5 to Food'_\n"
-        "• `/delete <id>` to delete a record\n\n"
-        "📊 *How to query:*\n"
-        "• 'Total expense today'\n"
-        "• 'How much did I spend this week?'\n"
-        "• 'Show food expenses this month'\n"
-        "• 'Show recent transactions'\n\n"
+        "👋 *Welcome to your Expense & Balance Bot!*\n\n"
+        "💡 *What I can do:*\n"
+        "• *Track Slips:* Send any bank slip photo, and I'll record amount, date, receiver & category.\n"
+        "• *Balance Tracking:* Bank accounts & Cash are tracked separately!\n"
+        "• *Quick Menu:* Tap any button below for instant summaries.\n\n"
+        "⚙️ *Setup Your Initial Balance:*\n"
+        "• `/setbalance bank <amount>` (e.g. `/setbalance bank 50000`)\n"
+        "• `/setbalance cash <amount>` (e.g. `/setbalance cash 2500`)\n"
+        "• Or record manual cash spending: `/cash <amount> <category> <note>`\n\n"
+        "✏️ *Editing Transactions:*\n"
+        "• `/edit <id> category <new category>`\n"
+        "• `/edit <id> amount <new amount>`\n"
+        "• `/delete <id>`\n\n"
         f"Your Telegram User ID: `{user_id}`"
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(
+        text,
+        reply_markup=get_main_menu_keyboard(),
+        parse_mode="Markdown"
+    )
+
+async def set_balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        return
+
+    args = context.args
+    if not args or len(args) < 2:
+        await update.message.reply_text(
+            "Usage:\n"
+            "• `/setbalance bank 50000` (set bank balance)\n"
+            "• `/setbalance cash 3000` (set cash balance)",
+            parse_mode="Markdown"
+        )
+        return
+
+    target = args[0].lower()
+    try:
+        amount = float(args[1].replace(",", ""))
+    except ValueError:
+        await update.message.reply_text("Please provide a valid numeric amount.")
+        return
+
+    if target in ("bank", "account"):
+        database.set_initial_balance(user_id, initial_bank=amount)
+        await update.message.reply_text(f"✅ Initial bank balance set to: `{amount:,.2f} THB`\n\n" + queries.format_balance_message(user_id), parse_mode="Markdown")
+    elif target in ("cash", "wallet"):
+        database.set_initial_balance(user_id, initial_cash=amount)
+        await update.message.reply_text(f"✅ Initial cash balance set to: `{amount:,.2f} THB`\n\n" + queries.format_balance_message(user_id), parse_mode="Markdown")
+    else:
+        await update.message.reply_text("Target must be either `bank` or `cash`.\nExample: `/setbalance bank 25000`", parse_mode="Markdown")
+
+async def cash_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        return
+
+    args = context.args
+    if not args or len(args) < 1:
+        await update.message.reply_text(
+            "Usage: `/cash <amount> [category] [note]`\n"
+            "Example: `/cash 60 Food Lunch with cash`",
+            parse_mode="Markdown"
+        )
+        return
+
+    try:
+        amount = float(args[0].replace(",", ""))
+    except ValueError:
+        await update.message.reply_text("Please enter a valid amount.")
+        return
+
+    category = args[1] if len(args) > 1 else "General"
+    raw_note = " ".join(args[2:]) if len(args) > 2 else "Cash payment"
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    tx_id = database.add_transaction(
+        user_id=user_id,
+        trans_type="expense",
+        amount=amount,
+        category=category,
+        raw_note=raw_note,
+        sender="Me",
+        receiver="Cash Payment",
+        bank="Cash",
+        trans_datetime=now_str,
+        account_type="cash"
+    )
+
+    await update.message.reply_text(
+        f"💵 *Cash Expense Recorded!*\n\n"
+        f"🆔 ID: #{tx_id}\n"
+        f"💸 Amount: `{amount:,.2f} THB`\n"
+        f"🏷️ Category: {category}\n"
+        f"📝 Note: {raw_note}\n\n"
+        f"{queries.format_balance_message(user_id)}",
+        reply_markup=get_tx_inline_keyboard(tx_id),
+        parse_mode="Markdown"
+    )
 
 async def edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -86,7 +182,7 @@ async def edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not args or len(args) < 3:
         await update.message.reply_text(
             "Usage: `/edit <id> <field> <value>`\n"
-            "Fields: `category`, `amount`, `note`, `type`\n"
+            "Fields: `category`, `amount`, `note`, `account` (bank/cash)\n"
             "Example: `/edit 3 category Food & Dining`",
             parse_mode="Markdown"
         )
@@ -117,13 +213,15 @@ async def edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     elif field in ("note", "raw_note", "remark", "memo"):
         update_kwargs["raw_note"] = value
+    elif field in ("acc", "account", "account_type"):
+        update_kwargs["account_type"] = "cash" if "cash" in value.lower() else "bank"
     elif field in ("type", "trans_type"):
         if value.lower() not in ("expense", "income"):
             await update.message.reply_text("Type must be 'expense' or 'income'.")
             return
         update_kwargs["trans_type"] = value.lower()
     else:
-        await update.message.reply_text("Valid fields to edit are: `category`, `amount`, `note`, `type`", parse_mode="Markdown")
+        await update.message.reply_text("Valid fields: `category`, `amount`, `note`, `account`, `type`", parse_mode="Markdown")
         return
 
     success = database.update_transaction(user_id, tx_id, **update_kwargs)
@@ -134,6 +232,7 @@ async def edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• Type: {updated['trans_type'].upper()}\n"
             f"• Amount: {updated['amount']:,.2f}\n"
             f"• Category: {updated['category']}\n"
+            f"• Account: {updated.get('account_type', 'bank').upper()}\n"
             f"• Note: {updated['raw_note'] or 'None'}"
         )
     else:
@@ -173,6 +272,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 f"{query.message.text}\n\n✏️ *Category updated to:* {new_cat}",
                 parse_mode="Markdown"
             )
+    elif data.startswith("setacc_"):
+        parts = data.split("_", 2)
+        tx_id = int(parts[1])
+        acc_type = parts[2]
+        if database.update_transaction(user_id, tx_id, account_type=acc_type):
+            await query.edit_message_text(
+                f"{query.message.text}\n\n💳 *Account changed to:* {acc_type.upper()}",
+                parse_mode="Markdown"
+            )
     elif data.startswith("deltx_"):
         parts = data.split("_", 1)
         tx_id = int(parts[1])
@@ -209,18 +317,20 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sender=slip.sender,
             receiver=slip.receiver,
             bank=slip.bank,
-            trans_datetime=slip.trans_datetime
+            trans_datetime=slip.trans_datetime,
+            account_type="bank"
         )
 
         reply = (
-            f"✅ Recorded successfully!\n\n"
+            f"✅ *Recorded successfully!*\n\n"
             f"🆔 ID: #{tx_id}\n"
-            f"💵 Amount: {slip.amount:,.2f} {slip.currency or 'THB'}\n"
+            f"💵 Amount: `{slip.amount:,.2f} {slip.currency or 'THB'}`\n"
             f"🏷️ Category: {slip.category}\n"
             f"📝 Note: {slip.raw_note or 'None'}\n"
             f"👤 To: {slip.receiver or 'Unknown'}\n"
-            f"📅 Date: {slip.trans_datetime}\n\n"
-            f"_Tap a button below to quick-change category or delete:_"
+            f"📅 Date: {slip.trans_datetime}\n"
+            f"💳 Source: BANK ACCOUNT\n\n"
+            f"_Tap buttons below to change category/account or delete:_"
         )
         await status_msg.edit_text(
             reply,
@@ -238,9 +348,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_text = update.message.text.strip()
+    
+    # Check for help button
+    if user_text in ("❓ Help", "help", "/help"):
+        await start_command(update, context)
+        return
+
     try:
         reply = queries.answer_user_query(user_id, user_text)
-        await update.message.reply_text(reply, parse_mode="Markdown")
+        await update.message.reply_text(
+            reply,
+            reply_markup=get_main_menu_keyboard(),
+            parse_mode="Markdown"
+        )
     except Exception as e:
         logger.exception("Error answering query")
         await update.message.reply_text(f"Error processing question: {str(e)}")
@@ -256,6 +376,8 @@ def main():
     app = ApplicationBuilder().token(token).build()
 
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("setbalance", set_balance_command))
+    app.add_handler(CommandHandler("cash", cash_command))
     app.add_handler(CommandHandler("edit", edit_command))
     app.add_handler(CommandHandler("delete", delete_command))
     app.add_handler(CallbackQueryHandler(handle_callback_query))
