@@ -59,8 +59,11 @@ def get_tx_inline_keyboard(tx_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("✏️ Shopping", callback_data=f"setcat_{tx_id}_Shopping"),
         ],
         [
-            InlineKeyboardButton("✏️ Bills", callback_data=f"setcat_{tx_id}_Bills & Utilities"),
-            InlineKeyboardButton("💳 Paid via Cash", callback_data=f"setacc_{tx_id}_cash"),
+            InlineKeyboardButton("🔄 Set Income", callback_data=f"settype_{tx_id}_income"),
+            InlineKeyboardButton("🔄 Set Expense", callback_data=f"settype_{tx_id}_expense"),
+            InlineKeyboardButton("💳 Cash/Bank", callback_data=f"toggleacc_{tx_id}"),
+        ],
+        [
             InlineKeyboardButton("🗑️ Delete", callback_data=f"deltx_{tx_id}"),
         ]
     ]
@@ -81,7 +84,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚙️ *Setup Your Initial Balance:*\n"
         "• `/setbalance bank <amount>` (e.g. `/setbalance bank 50000`)\n"
         "• `/setbalance cash <amount>` (e.g. `/setbalance cash 2500`)\n"
-        "• Or record manual cash spending: `/cash <amount> <category> <note>`\n\n"
+        "• Record income: `/income <amount> [bank/cash] [category] [note]`\n"
+        "• Record manual cash spending: `/cash <amount> <category> <note>`\n\n"
         "✏️ *Editing Transactions:*\n"
         "• `/edit <id> category <new category>`\n"
         "• `/edit <id> amount <new amount>`\n"
@@ -167,6 +171,68 @@ async def cash_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🆔 ID: #{tx_id}\n"
         f"💸 Amount: `{amount:,.2f} THB`\n"
         f"🏷️ Category: {category}\n"
+        f"📝 Note: {raw_note}\n\n"
+        f"{queries.format_balance_message(user_id)}",
+        reply_markup=get_tx_inline_keyboard(tx_id),
+        parse_mode="Markdown"
+    )
+
+async def income_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        return
+
+    args = context.args
+    if not args or len(args) < 1:
+        await update.message.reply_text(
+            "Usage: `/income <amount> [bank/cash] [category] [note]`\n"
+            "Examples:\n"
+            "• `/income 35000 bank Salary Monthly salary`\n"
+            "• `/income 500 cash Gift Received cash gift`",
+            parse_mode="Markdown"
+        )
+        return
+
+    try:
+        amount = float(args[0].replace(",", ""))
+    except ValueError:
+        await update.message.reply_text("Please enter a valid amount.")
+        return
+
+    account_type = "bank"
+    category = "Income"
+    note_start_idx = 1
+
+    if len(args) > 1 and args[1].lower() in ("bank", "cash"):
+        account_type = args[1].lower()
+        note_start_idx = 2
+
+    if len(args) > note_start_idx:
+        category = args[note_start_idx]
+        note_start_idx += 1
+
+    raw_note = " ".join(args[note_start_idx:]) if len(args) > note_start_idx else "Income"
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    tx_id = database.add_transaction(
+        user_id=user_id,
+        trans_type="income",
+        amount=amount,
+        category=category,
+        raw_note=raw_note,
+        sender="External",
+        receiver="Me",
+        bank="Bank" if account_type == "bank" else "Cash",
+        trans_datetime=now_str,
+        account_type=account_type
+    )
+
+    await update.message.reply_text(
+        f"💵 *Income Recorded!*\n\n"
+        f"🆔 ID: #{tx_id}\n"
+        f"💰 Amount: `+{amount:,.2f} THB`\n"
+        f"🏷️ Category: {category}\n"
+        f"💳 Deposited to: {account_type.upper()}\n"
         f"📝 Note: {raw_note}\n\n"
         f"{queries.format_balance_message(user_id)}",
         reply_markup=get_tx_inline_keyboard(tx_id),
@@ -272,6 +338,27 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 f"{query.message.text}\n\n✏️ *Category updated to:* {new_cat}",
                 parse_mode="Markdown"
             )
+    elif data.startswith("settype_"):
+        parts = data.split("_", 2)
+        tx_id = int(parts[1])
+        new_type = parts[2]
+        if database.update_transaction(user_id, tx_id, trans_type=new_type):
+            await query.edit_message_text(
+                f"{query.message.text}\n\n🔄 *Type changed to:* {new_type.upper()}",
+                parse_mode="Markdown"
+            )
+    elif data.startswith("toggleacc_"):
+        parts = data.split("_", 1)
+        tx_id = int(parts[1])
+        tx = database.get_transaction_by_id(user_id, tx_id)
+        if tx:
+            current_acc = tx.get("account_type", "bank")
+            new_acc = "cash" if current_acc == "bank" else "bank"
+            if database.update_transaction(user_id, tx_id, account_type=new_acc):
+                await query.edit_message_text(
+                    f"{query.message.text}\n\n💳 *Account changed to:* {new_acc.upper()}",
+                    parse_mode="Markdown"
+                )
     elif data.startswith("setacc_"):
         parts = data.split("_", 2)
         tx_id = int(parts[1])
@@ -329,8 +416,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📝 Note: {slip.raw_note or 'None'}\n"
             f"👤 To: {slip.receiver or 'Unknown'}\n"
             f"📅 Date: {slip.trans_datetime}\n"
-            f"💳 Source: BANK ACCOUNT\n\n"
-            f"_Tap buttons below to change category/account or delete:_"
+            f"💳 Source: BANK ACCOUNT\n"
+            f"🔄 Flow: {slip.trans_type.upper()}\n\n"
+            f"_Tap buttons below to change category/type/account or delete:_"
         )
         await status_msg.edit_text(
             reply,
@@ -378,6 +466,7 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("setbalance", set_balance_command))
     app.add_handler(CommandHandler("cash", cash_command))
+    app.add_handler(CommandHandler("income", income_command))
     app.add_handler(CommandHandler("edit", edit_command))
     app.add_handler(CommandHandler("delete", delete_command))
     app.add_handler(CallbackQueryHandler(handle_callback_query))
